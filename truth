@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""truth -- append-only claims ledger beside Beads.
+
+Records four kinds of events in .truth/claims.jsonl (one JSON object per line):
+  claim         a statement about the system, with evidence class + provenance
+  verdict       an independent verification result referencing a claim
+  invalidation  a record that a later commit touched a claim's evidence paths
+  premise       a link from a Beads issue (bd-*) to a claim it depends on
+
+Status is never mutated; it is derived by folding events in file order:
+  no events            -> unverified
+  verdict agree        -> live
+  verdict diverge      -> diverged
+  verdict cannot_verify-> cannot_verify
+  invalidation         -> stale
+Last event wins.
+
+Edges (ratified):
+  E1 Beads is read-only from here; premises reference bd-* ids as opaque strings.
+  E2 VERIFIED claims must cite a re-runnable command; `verdict --recheck`
+     re-executes it and compares output hashes (deterministic T1 canary).
+  E3 The ledger is append-only; enforced by scripts/check-truth.sh in CI.
+  E4 One command files a claim end-to-end.
+  E5 Verifier and human queue are consumers of the fold, not components.
+
+Stdlib only. Python 3.9+.
+"""
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+LEDGER_REL = ".truth/claims.jsonl"
+EVIDENCE_CLASSES = ("VERIFIED", "INFERRED", "UNVERIFIED")
+TIERS = ("P0", "P1", "P2")
+VERDICTS = ("agree", "diverge", "cannot_verify")
+KINDS = ("claim", "verdict", "invalidation", "premise")
+
+# ---------------------------------------------------------------- plumbing
+
+def repo_root():
+    r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("truth: not inside a git repository")
+    return r.stdout.strip()
+
+def ledger_path():
+    return os.path.join(repo_root(), LEDGER_REL)
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def head_commit():
+    r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+def actor():
+    return os.environ.get("TRUTH_ACTOR", os.environ.get("USER", "unknown"))
+
+def session():
+    return os.environ.get("TRUTH_SESSION", "s-unknown")
+
+def make_id(payload):
+    blob = json.dumps(payload, sort_keys=True) + now_iso() + actor()
+    return "tr-" + hashlib.sha256(blob.encode()).hexdigest()[:8]
+
+def append_record(kind, payload):
+    rec = {"id": make_id(payload), "kind": kind, "actor": actor(),
+           "session": session(), "ts": now_iso(), "payload": payload}
+    path = ledger_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
+    return rec
+
+def load_events(stream=None):
+    events = []
+    if stream is not None:
+        lines = stream.read().splitlines()
+    else:
+        path = ledger_path()
+        if not os.path.exists(path):
+            return events
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    for n, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            events.append((n, json.loads(line)))
+        except json.JSONDecodeError:
+            sys.exit(f"truth: line {n} is not valid JSON")
+    return events
+
+def run_evidence(cmd):
+    r = subprocess.run(cmd, shell=True, capture_output=True)
+    digest = hashlib.sha256(r.stdout).hexdigest()
+    return digest, r.returncode
+
+# ---------------------------------------------------------------- fold
+
+def fold(events):
+    """Derive claim states and the premise map from the event log."""
+    claims, premises = {}, {}
+    for _, ev in events:
+        kind, p = ev.get("kind"), ev.get("payload", {})
+        if kind == "claim":
+            claims[ev["id"]] = {"claim": ev, "status": "unverified"}
+        elif kind == "verdict":
+            c = p.get("claim")
+            if c in claims:
+                claims[c]["status"] = {"agree": "live", "diverge": "diverged",
+                                       "cannot_verify": "cannot_verify"}[p["verdict"]]
+        elif kind == "invalidation":
+            c = p.get("claim")
+            if c in claims:
+                claims[c]["status"] = "stale"
+        elif kind == "premise":
+            premises.setdefault(p["issue"], []).append(p["claim"])
+    return claims, premises
+
+def match_paths(path, patterns):
+    for pat in patterns:
+        if pat.endswith("/**"):
+            base = pat[:-3]
+            if path == base or path.startswith(base + "/"):
+                return True
+        if fnmatch.fnmatch(path, pat):
+            return True
+    return False
+
+# ---------------------------------------------------------------- commands
+
+def cmd_claim(a):
+    payload = {"text": a.text, "evidence_class": a.evidence_class,
+               "cost_tier": a.tier, "ttl_days": a.ttl_days,
+               "evidence_paths": [p.strip() for p in a.paths.split(",")] if a.paths else []}
+    if a.evidence_class == "VERIFIED":
+        if not a.evidence_cmd:
+            sys.exit("truth: VERIFIED claims require --evidence-cmd (INV-B)")
+        digest, rc = run_evidence(a.evidence_cmd)
+        payload["evidence"] = {"command": a.evidence_cmd,
+                               "output_hash": "sha256:" + digest, "returncode": rc}
+        payload["anchor_commit"] = head_commit()
+        if not payload["evidence_paths"]:
+            sys.exit("truth: VERIFIED claims require --paths (INV-C needs them)")
+    elif a.evidence_class == "INFERRED":
+        if not a.basis:
+            sys.exit("truth: INFERRED claims require --basis")
+        payload["basis"] = a.basis
+    rec = append_record("claim", payload)
+    print(json.dumps(rec) if a.json else rec["id"])
+
+def cmd_verdict(a):
+    events = load_events()
+    claims, _ = fold(events)
+    if a.claim_id not in claims:
+        sys.exit(f"truth: unknown claim {a.claim_id}")
+    if a.recheck:
+        ev = claims[a.claim_id]["claim"]["payload"].get("evidence")
+        if not ev:
+            verdict, basis = "cannot_verify", "recheck requested but claim carries no evidence command"
+        else:
+            digest, rc = run_evidence(ev["command"])
+            ok = ("sha256:" + digest == ev["output_hash"]) and rc == ev.get("returncode", rc)
+            verdict = "agree" if ok else "diverge"
+            basis = f"recheck: output hash {'matches' if ok else 'MISMATCH'} recorded evidence"
+    else:
+        if not a.verdict or not a.basis:
+            sys.exit("truth: manual verdicts require <verdict> and --basis")
+        verdict, basis = a.verdict, a.basis
+    rec = append_record("verdict", {"claim": a.claim_id, "verdict": verdict, "basis": basis})
+    print(json.dumps(rec) if a.json else f"{a.claim_id} -> {verdict}")
+
+def cmd_invalidate_scan(a):
+    events = load_events()
+    claims, _ = fold(events)
+    head = head_commit()
+    hits = []
+    for cid, entry in claims.items():
+        if entry["status"] not in ("live", "unverified"):
+            continue
+        p = entry["claim"]["payload"]
+        anchor, paths = p.get("anchor_commit"), p.get("evidence_paths", [])
+        if not anchor or not paths or anchor == head:
+            continue
+        r = subprocess.run(["git", "diff", "--name-only", f"{anchor}..HEAD"],
+                           capture_output=True, text=True)
+        touched = [f for f in r.stdout.splitlines() if match_paths(f, paths)]
+        if touched:
+            append_record("invalidation", {"claim": cid, "commit": head, "touched": touched})
+            hits.append(cid)
+    if not a.quiet:
+        for cid in hits:
+            print(f"stale: {cid}")
+        print(f"invalidate-scan: {len(hits)} claim(s) marked stale")
+
+def cmd_premise(a):
+    rec = append_record("premise", {"issue": a.issue, "claim": a.claim_id})
+    print(json.dumps(rec) if a.json else rec["id"])
+
+def cmd_list(a):
+    claims, _ = fold(load_events())
+    want = {f for f in ("unverified", "live", "stale", "diverged", "cannot_verify")
+            if getattr(a, f)}
+    rows = [{"id": cid, "status": e["status"],
+             "tier": e["claim"]["payload"].get("cost_tier"),
+             "class": e["claim"]["payload"].get("evidence_class"),
+             "text": e["claim"]["payload"].get("text")}
+            for cid, e in claims.items() if not want or e["status"] in want]
+    if a.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        for r in rows:
+            print(f"{r['id']}  {r['status']:<13} {r['tier']:<3} {r['class']:<10} {r['text']}")
+
+def cmd_queue(a):
+    claims, _ = fold(load_events())
+    rows = [{"id": cid, "status": e["status"], "reason":
+             "author/verifier diverged" if e["status"] == "diverged"
+             else "evidence paths changed since verification",
+             "tier": e["claim"]["payload"].get("cost_tier"),
+             "text": e["claim"]["payload"].get("text")}
+            for cid, e in claims.items()
+            if e["status"] == "diverged"
+            or (e["status"] == "stale" and e["claim"]["payload"].get("cost_tier") in ("P0", "P1"))]
+    if a.json:
+        print(json.dumps(rows, indent=2))
+    elif not rows:
+        print("queue empty: no divergence, no stale P0/P1 claims")
+    else:
+        for r in rows:
+            print(f"{r['id']}  {r['tier']:<3} {r['status']:<9} {r['reason']}: {r['text']}")
+
+def cmd_ready(a):
+    claims, premises = fold(load_events())
+    r = subprocess.run(["bd", "ready", "--json"], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("truth: `bd ready --json` failed -- is Beads installed and initialized?")
+    issues = json.loads(r.stdout or "[]")
+    out = []
+    for issue in issues:
+        iid = issue.get("id", "")
+        deps = premises.get(iid, [])
+        broken = [c for c in deps if c not in claims or claims[c]["status"] != "live"]
+        unpremised = [c for c in deps if c not in claims]
+        if deps and broken:
+            issue["_truth"] = {"ready": False, "broken_premises": broken,
+                               "unresolved": unpremised}
+        else:
+            issue["_truth"] = {"ready": True, "premises": deps}
+            out.append(issue)
+    if a.json:
+        print(json.dumps(out, indent=2))
+    else:
+        for i in out:
+            print(f"{i.get('id')}  {i.get('title', i.get('text', ''))}")
+        held = [i for i in issues if not i["_truth"]["ready"]]
+        for i in held:
+            print(f"HELD {i.get('id')}  broken premises: {','.join(i['_truth']['broken_premises'])}")
+
+def cmd_validate(a):
+    stream = sys.stdin if a.stdin else None
+    events = load_events(stream)
+    errors = []
+    for n, ev in events:
+        for field in ("id", "kind", "actor", "session", "ts", "payload"):
+            if field not in ev:
+                errors.append(f"line {n}: missing envelope field '{field}'")
+        kind, p = ev.get("kind"), ev.get("payload", {})
+        if kind not in KINDS:
+            errors.append(f"line {n}: unknown kind '{kind}'")
+        elif kind == "claim":
+            if p.get("evidence_class") not in EVIDENCE_CLASSES:
+                errors.append(f"line {n}: bad evidence_class")
+            if p.get("cost_tier") not in TIERS:
+                errors.append(f"line {n}: bad cost_tier")
+            if p.get("evidence_class") == "VERIFIED":
+                ev_ = p.get("evidence", {})
+                if not (ev_.get("command") and ev_.get("output_hash")
+                        and p.get("anchor_commit") and p.get("evidence_paths")):
+                    errors.append(f"line {n}: VERIFIED claim missing evidence provenance (INV-B)")
+        elif kind == "verdict":
+            if p.get("verdict") not in VERDICTS or not p.get("claim") or not p.get("basis"):
+                errors.append(f"line {n}: malformed verdict")
+        elif kind == "invalidation":
+            if not p.get("claim") or not p.get("commit"):
+                errors.append(f"line {n}: malformed invalidation")
+        elif kind == "premise":
+            if not p.get("issue") or not p.get("claim"):
+                errors.append(f"line {n}: malformed premise")
+    if errors:
+        print("\n".join(errors), file=sys.stderr)
+        sys.exit(1)
+    print(f"validate: {len(events)} record(s) OK")
+
+# ---------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="truth", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("claim", help="file a claim (one command, end to end)")
+    c.add_argument("text")
+    c.add_argument("--class", dest="evidence_class", default="UNVERIFIED",
+                   choices=EVIDENCE_CLASSES)
+    c.add_argument("--evidence-cmd", help="re-runnable command whose output is the evidence")
+    c.add_argument("--paths", help="comma-separated globs the evidence depends on")
+    c.add_argument("--tier", default="P2", choices=TIERS)
+    c.add_argument("--ttl-days", type=int, default=None)
+    c.add_argument("--basis", help="reasoning basis (required for INFERRED)")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=cmd_claim)
+
+    v = sub.add_parser("verdict", help="record a verification verdict")
+    v.add_argument("claim_id")
+    v.add_argument("verdict", nargs="?", choices=VERDICTS)
+    v.add_argument("--basis")
+    v.add_argument("--recheck", action="store_true",
+                   help="re-run the claim's evidence command and compare hashes")
+    v.add_argument("--json", action="store_true")
+    v.set_defaults(fn=cmd_verdict)
+
+    s = sub.add_parser("invalidate-scan", help="mark claims stale whose evidence paths changed")
+    s.add_argument("--quiet", action="store_true")
+    s.set_defaults(fn=cmd_invalidate_scan)
+
+    p = sub.add_parser("premise", help="link a Beads issue to a claim it depends on")
+    p.add_argument("issue")
+    p.add_argument("claim_id")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_premise)
+
+    l = sub.add_parser("list", help="list claims by derived status")
+    for flag in ("unverified", "live", "stale", "diverged", "cannot_verify"):
+        l.add_argument("--" + flag.replace("_", "-"), dest=flag, action="store_true")
+    l.add_argument("--json", action="store_true")
+    l.set_defaults(fn=cmd_list)
+
+    q = sub.add_parser("queue", help="human review queue: divergence + stale P0/P1")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(fn=cmd_queue)
+
+    r = sub.add_parser("ready", help="bd ready filtered by premise validity")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(fn=cmd_ready)
+
+    val = sub.add_parser("validate", help="schema-check every ledger record")
+    val.add_argument("--stdin", action="store_true", help="read ledger from stdin")
+    val.set_defaults(fn=cmd_validate)
+
+    args = ap.parse_args()
+    try:
+        args.fn(args)
+    except BrokenPipeError:
+        # Downstream consumer (e.g. `| grep -q`) closed the pipe early;
+        # that is their prerogative, not our error.
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,105 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "truth-ledger-record.v0",
+  "title": "Truth ledger record",
+  "description": "One line of .truth/claims.jsonl. The ledger is append-only and event-sourced: status is never stored, only derived by folding records in file order (last event wins). This schema is the durable contract; scripts/truth validate implements a stdlib mirror of it.",
+  "type": "object",
+  "required": ["id", "kind", "actor", "session", "ts", "payload"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^tr-[0-9a-f]{8}$" },
+    "kind": { "enum": ["claim", "verdict", "invalidation", "premise"] },
+    "actor": { "type": "string", "minLength": 1 },
+    "session": { "type": "string", "minLength": 1 },
+    "ts": { "type": "string", "format": "date-time" },
+    "payload": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "claim" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "required": ["text", "evidence_class", "cost_tier"],
+            "properties": {
+              "text": { "type": "string", "minLength": 1 },
+              "evidence_class": { "enum": ["VERIFIED", "INFERRED", "UNVERIFIED"] },
+              "cost_tier": { "enum": ["P0", "P1", "P2"] },
+              "ttl_days": { "type": ["integer", "null"], "minimum": 1 },
+              "evidence_paths": { "type": "array", "items": { "type": "string" } },
+              "anchor_commit": { "type": ["string", "null"] },
+              "basis": { "type": "string" },
+              "evidence": {
+                "type": "object",
+                "required": ["command", "output_hash"],
+                "properties": {
+                  "command": { "type": "string", "minLength": 1 },
+                  "output_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                  "returncode": { "type": "integer" }
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "evidence_class": { "const": "VERIFIED" } } },
+                "then": {
+                  "required": ["evidence", "anchor_commit", "evidence_paths"],
+                  "properties": {
+                    "evidence_paths": { "minItems": 1 }
+                  }
+                }
+              },
+              {
+                "if": { "properties": { "evidence_class": { "const": "INFERRED" } } },
+                "then": { "required": ["basis"] }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "verdict" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "required": ["claim", "verdict", "basis"],
+            "properties": {
+              "claim": { "type": "string", "pattern": "^tr-[0-9a-f]{8}$" },
+              "verdict": { "enum": ["agree", "diverge", "cannot_verify"] },
+              "basis": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "invalidation" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "required": ["claim", "commit"],
+            "properties": {
+              "claim": { "type": "string", "pattern": "^tr-[0-9a-f]{8}$" },
+              "commit": { "type": "string", "minLength": 7 },
+              "touched": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "premise" } } },
+      "then": {
+        "properties": {
+          "payload": {
+            "required": ["issue", "claim"],
+            "properties": {
+              "issue": { "type": "string", "minLength": 1 },
+              "claim": { "type": "string", "pattern": "^tr-[0-9a-f]{8}$" }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
