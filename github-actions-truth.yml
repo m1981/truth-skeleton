@@ -1,0 +1,51 @@
+# examples/github-actions-truth.yml
+# G3: CI equivalents of the two git hooks, for environments where
+# .git/hooks cannot be relied on (fresh clones, CI bots, hook-disabled
+# checkouts). Copy to .github/workflows/truth.yml and adjust branch names.
+#
+# Job 1 mirrors the pre-commit gate (INV-A append-only + INV-B schema) on
+# every PR. Job 2 mirrors the post-merge invalidate-scan (INV-C causal +
+# G10 TTL + G14 unreachable anchors) after merges to main, committing any
+# new invalidation records back to the ledger.
+
+name: truth-ledger
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  gate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: INV-A append-only (PR must not modify or delete ledger lines)
+        run: |
+          BASE="origin/${{ github.base_ref }}"
+          git fetch origin "${{ github.base_ref }}" --quiet
+          if git diff "$BASE"...HEAD -- .truth/claims.jsonl | grep -Eq '^-[^-]'; then
+            echo "::error::.truth/claims.jsonl is append-only; a historical record was modified or deleted (INV-A)."
+            exit 1
+          fi
+      - name: INV-B schema validation
+        run: python3 scripts/truth validate
+
+  invalidate:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: INV-C / G10 / G14 invalidation scan
+        run: python3 scripts/truth invalidate-scan
+      - name: Commit new invalidation records, if any
+        run: |
+          if ! git diff --quiet -- .truth/claims.jsonl; then
+            git config user.name "truth-invalidator"
+            git config user.email "truth-invalidator@ci"
+            git add .truth/claims.jsonl
+            git commit -m "chore(truth): invalidation scan after merge"
+            git push
+          fi

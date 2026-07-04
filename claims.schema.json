@@ -1,8 +1,8 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "truth-ledger-record.v0",
+  "$id": "truth-ledger-record.v0.2",
   "title": "Truth ledger record",
-  "description": "One line of .truth/claims.jsonl. The ledger is append-only and event-sourced: status is never stored, only derived by folding records in file order (last event wins). This schema is the durable contract; scripts/truth validate implements a stdlib mirror of it.",
+  "description": "One line of .truth/claims.jsonl. Append-only, event-sourced: status is derived by folding records in file order (last event wins; 'retracted' is terminal). v0.2 changes: verdict gains 'retracted' (G12, humans only); invalidation gains optional 'reason' (G10/G14); VERIFIED claims may carry ttl_days instead of evidence_paths for facts outside the repo (G10).",
   "type": "object",
   "required": ["id", "kind", "actor", "session", "ts", "payload"],
   "properties": {
@@ -42,10 +42,13 @@
               {
                 "if": { "properties": { "evidence_class": { "const": "VERIFIED" } } },
                 "then": {
-                  "required": ["evidence", "anchor_commit", "evidence_paths"],
-                  "properties": {
-                    "evidence_paths": { "minItems": 1 }
-                  }
+                  "required": ["evidence", "anchor_commit"],
+                  "anyOf": [
+                    { "properties": { "evidence_paths": { "minItems": 1 } },
+                      "required": ["evidence_paths"] },
+                    { "properties": { "ttl_days": { "type": "integer", "minimum": 1 } },
+                      "required": ["ttl_days"] }
+                  ]
                 }
               },
               {
@@ -65,7 +68,7 @@
             "required": ["claim", "verdict", "basis"],
             "properties": {
               "claim": { "type": "string", "pattern": "^tr-[0-9a-f]{8}$" },
-              "verdict": { "enum": ["agree", "diverge", "cannot_verify"] },
+              "verdict": { "enum": ["agree", "diverge", "cannot_verify", "retracted"] },
               "basis": { "type": "string", "minLength": 1 }
             }
           }
@@ -81,7 +84,8 @@
             "properties": {
               "claim": { "type": "string", "pattern": "^tr-[0-9a-f]{8}$" },
               "commit": { "type": "string", "minLength": 7 },
-              "touched": { "type": "array", "items": { "type": "string" } }
+              "touched": { "type": "array", "items": { "type": "string" } },
+              "reason": { "type": "string" }
             }
           }
         }

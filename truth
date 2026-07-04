@@ -1,44 +1,70 @@
 #!/usr/bin/env python3
-"""truth -- append-only claims ledger beside Beads.
+"""truth v0.2 -- append-only claims ledger beside Beads.
 
-Records four kinds of events in .truth/claims.jsonl (one JSON object per line):
+Records five event kinds in .truth/claims.jsonl (one JSON object per line):
   claim         a statement about the system, with evidence class + provenance
-  verdict       an independent verification result referencing a claim
-  invalidation  a record that a later commit touched a claim's evidence paths
+  verdict       a verification result referencing a claim
+                (agree | diverge | cannot_verify | retracted)
+  invalidation  a record that a claim's evidence no longer holds
+                (paths touched, TTL expired, or anchor unreachable)
   premise       a link from a Beads issue (bd-*) to a claim it depends on
 
-Status is never mutated; it is derived by folding events in file order:
-  no events            -> unverified
-  verdict agree        -> live
-  verdict diverge      -> diverged
-  verdict cannot_verify-> cannot_verify
-  invalidation         -> stale
-Last event wins.
+Status is never stored or edited; it is derived by folding events in file
+order (last event wins), with one terminal state:
+  no events             -> unverified
+  verdict agree         -> live
+  verdict diverge       -> diverged
+  verdict cannot_verify -> cannot_verify
+  verdict retracted     -> retracted   (TERMINAL: later events are ignored)
+  invalidation          -> stale
 
-Edges (ratified):
-  E1 Beads is read-only from here; premises reference bd-* ids as opaque strings.
-  E2 VERIFIED claims must cite a re-runnable command; `verdict --recheck`
-     re-executes it and compares output hashes (deterministic T1 canary).
-  E3 The ledger is append-only; enforced by scripts/check-truth.sh in CI.
-  E4 One command files a claim end-to-end.
-  E5 Verifier and human queue are consumers of the fold, not components.
+Gap fixes in v0.2 (see USE-CASES gap register):
+  G1  VERIFIED claims refuse to file in a repo with no commits.
+  G6  intake runs the evidence command twice; nondeterministic output is
+      refused (skip with --single-run for expensive commands).
+  G8  near-duplicate of an ACTIVE (live/unverified) claim is refused
+      (override with --duplicate-ok; corrections of stale/diverged/
+      retracted claims are always allowed).
+  G10 invalidate-scan expires claims whose ttl_days has elapsed.
+  G12 `retracted` verdict is a terminal tombstone; humans only.
+  G13 queue shows age in days since the status-setting event.
+  G14 unreachable anchor commits (rebase/gc) invalidate the claim with
+      reason "anchor unreachable" -- fail toward distrust, never silence.
+  G15 premise semantics per ADR-001: live passes; unverified passes with
+      warning; cannot_verify blocks only P0-tier claims; stale/diverged/
+      retracted/missing block.
+  G4  `truth doctor` checks the INSTALLATION (hooks, gitattributes,
+      discovery files, dangling premises, queue aging), which the sandbox
+      canary cannot.
+  G11 `truth dispatch` constructs the verifier context (prompt + claim
+      only) so independence is scripted, not hoped for.
 
-Stdlib only. Python 3.9+.
+Test hook: the TRUTH_NOW env var (ISO-8601) overrides the clock for the
+canary suite. Never set it in production.
+
+Stdlib only. Python 3.9+. POSIX (G5: documented limit).
 """
 import argparse
 import fnmatch
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 
 LEDGER_REL = ".truth/claims.jsonl"
+PROMPT_REL = "prompts/truth-verifier.md"
 EVIDENCE_CLASSES = ("VERIFIED", "INFERRED", "UNVERIFIED")
 TIERS = ("P0", "P1", "P2")
-VERDICTS = ("agree", "diverge", "cannot_verify")
+VERDICTS = ("agree", "diverge", "cannot_verify", "retracted")
 KINDS = ("claim", "verdict", "invalidation", "premise")
+STATUSES = ("unverified", "live", "stale", "diverged", "cannot_verify", "retracted")
+DISCOVERY_FILES = ("AGENTS.md", "CLAUDE.md", ".cursorrules",
+                   ".github/copilot-instructions.md")
+DUPLICATE_THRESHOLD = 0.6
+QUEUE_AGE_WARN_DAYS = 14
 
 # ---------------------------------------------------------------- plumbing
 
@@ -52,12 +78,23 @@ def repo_root():
 def ledger_path():
     return os.path.join(repo_root(), LEDGER_REL)
 
+def now_dt():
+    override = os.environ.get("TRUTH_NOW")
+    if override:
+        return datetime.fromisoformat(override)
+    return datetime.now(timezone.utc)
+
 def now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return now_dt().isoformat(timespec="seconds")
 
 def head_commit():
     r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
+
+def commit_reachable(sha):
+    r = subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"],
+                       capture_output=True)
+    return r.returncode == 0
 
 def actor():
     return os.environ.get("TRUTH_ACTOR", os.environ.get("USER", "unknown"))
@@ -99,27 +136,52 @@ def load_events(stream=None):
 
 def run_evidence(cmd):
     r = subprocess.run(cmd, shell=True, capture_output=True)
-    digest = hashlib.sha256(r.stdout).hexdigest()
-    return digest, r.returncode
+    return hashlib.sha256(r.stdout).hexdigest(), r.returncode
+
+def tokens(text):
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+def jaccard(a, b):
+    ta, tb = tokens(a), tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
 
 # ---------------------------------------------------------------- fold
 
 def fold(events):
-    """Derive claim states and the premise map from the event log."""
+    """Derive claim states (+ status timestamps) and the premise map.
+
+    Retracted is terminal (G12): once a claim folds to retracted, all later
+    verdicts and invalidations against it are ignored.
+    """
     claims, premises = {}, {}
+    def set_status(cid, status, ts):
+        if claims[cid]["status"] == "retracted":
+            return
+        claims[cid]["status"] = status
+        claims[cid]["status_ts"] = ts
     for _, ev in events:
         kind, p = ev.get("kind"), ev.get("payload", {})
         if kind == "claim":
-            claims[ev["id"]] = {"claim": ev, "status": "unverified"}
+            claims[ev["id"]] = {"claim": ev, "status": "unverified",
+                                "status_ts": ev.get("ts")}
         elif kind == "verdict":
             c = p.get("claim")
             if c in claims:
-                claims[c]["status"] = {"agree": "live", "diverge": "diverged",
-                                       "cannot_verify": "cannot_verify"}[p["verdict"]]
+                m = {"agree": "live", "diverge": "diverged",
+                     "cannot_verify": "cannot_verify", "retracted": "retracted"}
+                set_status(c, m[p["verdict"]], ev.get("ts"))
         elif kind == "invalidation":
             c = p.get("claim")
             if c in claims:
-                claims[c]["status"] = "stale"
+                set_status(c, "stale", ev.get("ts"))
         elif kind == "premise":
             premises.setdefault(p["issue"], []).append(p["claim"])
     return claims, premises
@@ -134,25 +196,78 @@ def match_paths(path, patterns):
             return True
     return False
 
+def age_days(entry):
+    ts = parse_ts(entry.get("status_ts") or "")
+    if ts is None:
+        return None
+    delta = now_dt() - ts
+    return max(0, delta.days)
+
+# ------------------------------------------------------- premise semantics
+
+def premise_check(status, tier):
+    """ADR-001 matrix. Returns (passes, warning-or-None)."""
+    if status == "live":
+        return True, None
+    if status == "unverified":
+        return True, "premise not yet independently verified"
+    if status == "cannot_verify":
+        if tier == "P0":
+            return False, None
+        return True, "premise is cannot_verify (non-P0, passes per ADR-001)"
+    return False, None  # stale | diverged | retracted | missing
+
 # ---------------------------------------------------------------- commands
 
 def cmd_claim(a):
+    events = load_events()
+    claims, _ = fold(events)
+
+    # G8: refuse near-duplicates of ACTIVE claims. Corrections of stale,
+    # diverged, retracted or cannot_verify claims are legitimate (UC-4)
+    # and therefore exempt.
+    if not a.duplicate_ok:
+        similar = [(cid, e["claim"]["payload"].get("text", ""))
+                   for cid, e in claims.items()
+                   if e["status"] in ("live", "unverified")
+                   and jaccard(a.text, e["claim"]["payload"].get("text", ""))
+                   >= DUPLICATE_THRESHOLD]
+        if similar:
+            lines = "\n".join(f"  {cid}: {t}" for cid, t in similar)
+            sys.exit("truth: refusing near-duplicate of active claim(s) (G8):\n"
+                     f"{lines}\nRe-file with --duplicate-ok if genuinely distinct.")
+
     payload = {"text": a.text, "evidence_class": a.evidence_class,
                "cost_tier": a.tier, "ttl_days": a.ttl_days,
                "evidence_paths": [p.strip() for p in a.paths.split(",")] if a.paths else []}
+
     if a.evidence_class == "VERIFIED":
         if not a.evidence_cmd:
             sys.exit("truth: VERIFIED claims require --evidence-cmd (INV-B)")
+        if not payload["evidence_paths"] and not a.ttl_days:
+            sys.exit("truth: VERIFIED claims require --paths (INV-C) or "
+                     "--ttl-days for facts outside the repo (G10)")
+        head = head_commit()
+        if head is None:
+            sys.exit("truth: repository has no commits -- the anchor requires "
+                     "at least one commit before VERIFIED claims can be filed (G1)")
         digest, rc = run_evidence(a.evidence_cmd)
+        if not a.single_run:  # G6: determinism check
+            digest2, rc2 = run_evidence(a.evidence_cmd)
+            if digest != digest2 or rc != rc2:
+                sys.exit("truth: evidence command is nondeterministic -- two "
+                         "runs produced different output (G6). Make it "
+                         "deterministic (sort, strip timestamps) or accept the "
+                         "false-divergence risk explicitly with --single-run.")
+            digest, rc = digest2, rc2
         payload["evidence"] = {"command": a.evidence_cmd,
                                "output_hash": "sha256:" + digest, "returncode": rc}
-        payload["anchor_commit"] = head_commit()
-        if not payload["evidence_paths"]:
-            sys.exit("truth: VERIFIED claims require --paths (INV-C needs them)")
+        payload["anchor_commit"] = head
     elif a.evidence_class == "INFERRED":
         if not a.basis:
             sys.exit("truth: INFERRED claims require --basis")
         payload["basis"] = a.basis
+
     rec = append_record("claim", payload)
     print(json.dumps(rec) if a.json else rec["id"])
 
@@ -161,15 +276,22 @@ def cmd_verdict(a):
     claims, _ = fold(events)
     if a.claim_id not in claims:
         sys.exit(f"truth: unknown claim {a.claim_id}")
+    if claims[a.claim_id]["status"] == "retracted":
+        sys.exit(f"truth: {a.claim_id} is retracted -- terminal state (G12). "
+                 "File a new claim instead.")
     if a.recheck:
         ev = claims[a.claim_id]["claim"]["payload"].get("evidence")
         if not ev:
-            verdict, basis = "cannot_verify", "recheck requested but claim carries no evidence command"
+            verdict = "cannot_verify"
+            basis = "recheck requested but claim carries no evidence command"
         else:
             digest, rc = run_evidence(ev["command"])
-            ok = ("sha256:" + digest == ev["output_hash"]) and rc == ev.get("returncode", rc)
-            verdict = "agree" if ok else "diverge"
-            basis = f"recheck: output hash {'matches' if ok else 'MISMATCH'} recorded evidence"
+            if rc == 127:  # command/tool not found: environment, not reality
+                verdict, basis = "cannot_verify", "recheck: evidence command not found (exit 127)"
+            else:
+                ok = ("sha256:" + digest == ev["output_hash"]) and rc == ev.get("returncode", rc)
+                verdict = "agree" if ok else "diverge"
+                basis = f"recheck: output hash {'matches' if ok else 'MISMATCH'} recorded evidence"
     else:
         if not a.verdict or not a.basis:
             sys.exit("truth: manual verdicts require <verdict> and --basis")
@@ -180,24 +302,54 @@ def cmd_verdict(a):
 def cmd_invalidate_scan(a):
     events = load_events()
     claims, _ = fold(events)
-    head = head_commit()
+    head = head_commit() or "0000000"
     hits = []
     for cid, entry in claims.items():
         if entry["status"] not in ("live", "unverified"):
             continue
         p = entry["claim"]["payload"]
-        anchor, paths = p.get("anchor_commit"), p.get("evidence_paths", [])
-        if not anchor or not paths or anchor == head:
+
+        # G10: TTL expiry -- applies to any evidence class carrying ttl_days.
+        ttl = p.get("ttl_days")
+        claim_ts = parse_ts(entry["claim"].get("ts") or "")
+        if ttl and claim_ts and (now_dt() - claim_ts).total_seconds() > ttl * 86400:
+            append_record("invalidation",
+                          {"claim": cid, "commit": head,
+                           "reason": f"ttl expired ({ttl} days)"})
+            hits.append((cid, "ttl expired"))
             continue
+
+        anchor, paths = p.get("anchor_commit"), p.get("evidence_paths", [])
+        if not anchor or not paths:
+            continue
+        if anchor == head:
+            continue
+
+        # G14: history may have been rewritten (rebase, squash, gc).
+        if not commit_reachable(anchor):
+            append_record("invalidation",
+                          {"claim": cid, "commit": head,
+                           "reason": "anchor unreachable (history rewritten)"})
+            hits.append((cid, "anchor unreachable"))
+            continue
+
         r = subprocess.run(["git", "diff", "--name-only", f"{anchor}..HEAD"],
                            capture_output=True, text=True)
+        if r.returncode != 0:  # diff failed for another reason: distrust loudly
+            append_record("invalidation",
+                          {"claim": cid, "commit": head,
+                           "reason": f"diff against anchor failed: {r.stderr.strip()[:120]}"})
+            hits.append((cid, "diff failed"))
+            continue
         touched = [f for f in r.stdout.splitlines() if match_paths(f, paths)]
         if touched:
-            append_record("invalidation", {"claim": cid, "commit": head, "touched": touched})
-            hits.append(cid)
+            append_record("invalidation",
+                          {"claim": cid, "commit": head, "touched": touched,
+                           "reason": "evidence paths changed"})
+            hits.append((cid, "paths changed"))
     if not a.quiet:
-        for cid in hits:
-            print(f"stale: {cid}")
+        for cid, why in hits:
+            print(f"stale: {cid} ({why})")
         print(f"invalidate-scan: {len(hits)} claim(s) marked stale")
 
 def cmd_premise(a):
@@ -206,9 +358,8 @@ def cmd_premise(a):
 
 def cmd_list(a):
     claims, _ = fold(load_events())
-    want = {f for f in ("unverified", "live", "stale", "diverged", "cannot_verify")
-            if getattr(a, f)}
-    rows = [{"id": cid, "status": e["status"],
+    want = {f for f in STATUSES if getattr(a, f)}
+    rows = [{"id": cid, "status": e["status"], "age_days": age_days(e),
              "tier": e["claim"]["payload"].get("cost_tier"),
              "class": e["claim"]["payload"].get("evidence_class"),
              "text": e["claim"]["payload"].get("text")}
@@ -217,56 +368,98 @@ def cmd_list(a):
         print(json.dumps(rows, indent=2))
     else:
         for r in rows:
-            print(f"{r['id']}  {r['status']:<13} {r['tier']:<3} {r['class']:<10} {r['text']}")
+            print(f"{r['id']}  {r['status']:<13} {r['tier']:<3} "
+                  f"{r['class']:<10} {r['text']}")
+
+def queue_rows(claims):
+    rows = []
+    for cid, e in claims.items():
+        tier = e["claim"]["payload"].get("cost_tier")
+        status = e["status"]
+        reason = None
+        if status == "diverged":
+            reason = "author/verifier diverged"
+        elif status == "stale" and tier in ("P0", "P1"):
+            reason = "evidence invalidated"
+        elif status == "cannot_verify" and tier == "P0":
+            reason = "P0 claim unverifiable: fix evidence or retract"
+        if reason:
+            rows.append({"id": cid, "status": status, "tier": tier,
+                         "age_days": age_days(e), "reason": reason,
+                         "text": e["claim"]["payload"].get("text")})
+    return rows
 
 def cmd_queue(a):
     claims, _ = fold(load_events())
-    rows = [{"id": cid, "status": e["status"], "reason":
-             "author/verifier diverged" if e["status"] == "diverged"
-             else "evidence paths changed since verification",
-             "tier": e["claim"]["payload"].get("cost_tier"),
-             "text": e["claim"]["payload"].get("text")}
-            for cid, e in claims.items()
-            if e["status"] == "diverged"
-            or (e["status"] == "stale" and e["claim"]["payload"].get("cost_tier") in ("P0", "P1"))]
+    rows = queue_rows(claims)
     if a.json:
         print(json.dumps(rows, indent=2))
     elif not rows:
-        print("queue empty: no divergence, no stale P0/P1 claims")
+        print("queue empty: no divergence, no stale P0/P1, no unverifiable P0")
     else:
-        for r in rows:
-            print(f"{r['id']}  {r['tier']:<3} {r['status']:<9} {r['reason']}: {r['text']}")
+        for r in rows:  # G13: age surfaces attention debt
+            age = f"{r['age_days']}d" if r["age_days"] is not None else "?"
+            print(f"{r['id']}  {r['tier']:<3} {r['status']:<13} age {age:<5} "
+                  f"{r['reason']}: {r['text']}")
 
 def cmd_ready(a):
     claims, premises = fold(load_events())
     r = subprocess.run(["bd", "ready", "--json"], capture_output=True, text=True)
     if r.returncode != 0:
-        sys.exit("truth: `bd ready --json` failed -- is Beads installed and initialized?")
-    issues = json.loads(r.stdout or "[]")
+        sys.exit("truth: `bd ready --json` failed -- is Beads installed? "
+                 "Fallback: bd ready + truth list --live")
+    try:
+        issues = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        sys.exit("truth: bd ready output is not JSON -- Beads contract may "
+                 "have drifted (known E1 risk); report, do not patch around")
     out = []
     for issue in issues:
         iid = issue.get("id", "")
         deps = premises.get(iid, [])
-        broken = [c for c in deps if c not in claims or claims[c]["status"] != "live"]
-        unpremised = [c for c in deps if c not in claims]
-        if deps and broken:
-            issue["_truth"] = {"ready": False, "broken_premises": broken,
-                               "unresolved": unpremised}
+        broken, warnings = [], []
+        for c in deps:
+            if c not in claims:
+                broken.append(c + " (missing)")
+                continue
+            passes, warn = premise_check(claims[c]["status"],
+                                         claims[c]["claim"]["payload"].get("cost_tier"))
+            if not passes:
+                broken.append(f"{c} ({claims[c]['status']})")
+            elif warn:
+                warnings.append(f"{c}: {warn}")
+        if broken:
+            issue["_truth"] = {"ready": False, "broken_premises": broken}
         else:
-            issue["_truth"] = {"ready": True, "premises": deps}
+            issue["_truth"] = {"ready": True, "premises": deps, "warnings": warnings}
             out.append(issue)
     if a.json:
         print(json.dumps(out, indent=2))
     else:
         for i in out:
-            print(f"{i.get('id')}  {i.get('title', i.get('text', ''))}")
-        held = [i for i in issues if not i["_truth"]["ready"]]
-        for i in held:
-            print(f"HELD {i.get('id')}  broken premises: {','.join(i['_truth']['broken_premises'])}")
+            w = f"  [warn: {'; '.join(i['_truth']['warnings'])}]" if i["_truth"]["warnings"] else ""
+            print(f"{i.get('id')}  {i.get('title', i.get('text', ''))}{w}")
+        for i in issues:
+            if not i["_truth"]["ready"]:
+                print(f"HELD {i.get('id')}  broken premises: "
+                      f"{', '.join(i['_truth']['broken_premises'])}")
 
-def cmd_validate(a):
-    stream = sys.stdin if a.stdin else None
-    events = load_events(stream)
+def cmd_dispatch(a):
+    """G11: construct the verifier context by script, not by paste."""
+    claims, _ = fold(load_events())
+    if a.claim_id not in claims:
+        sys.exit(f"truth: unknown claim {a.claim_id}")
+    prompt_path = os.path.join(repo_root(), PROMPT_REL)
+    if not os.path.exists(prompt_path):
+        sys.exit(f"truth: verifier prompt missing at {PROMPT_REL}")
+    with open(prompt_path, encoding="utf-8") as f:
+        content = f.read()
+    body = content.split("\n---\n", 1)[-1]  # strip the human-facing header
+    print(body.strip())
+    print("\n\nCLAIM RECORD (verify exactly what is written):\n")
+    print(json.dumps(claims[a.claim_id]["claim"], indent=2, sort_keys=True))
+
+def validate_events(events):
     errors = []
     for n, ev in events:
         for field in ("id", "kind", "actor", "session", "ts", "payload"):
@@ -283,8 +476,10 @@ def cmd_validate(a):
             if p.get("evidence_class") == "VERIFIED":
                 ev_ = p.get("evidence", {})
                 if not (ev_.get("command") and ev_.get("output_hash")
-                        and p.get("anchor_commit") and p.get("evidence_paths")):
-                    errors.append(f"line {n}: VERIFIED claim missing evidence provenance (INV-B)")
+                        and p.get("anchor_commit")
+                        and (p.get("evidence_paths") or p.get("ttl_days"))):
+                    errors.append(f"line {n}: VERIFIED claim missing evidence "
+                                  "provenance (INV-B)")
         elif kind == "verdict":
             if p.get("verdict") not in VERDICTS or not p.get("claim") or not p.get("basis"):
                 errors.append(f"line {n}: malformed verdict")
@@ -294,10 +489,100 @@ def cmd_validate(a):
         elif kind == "premise":
             if not p.get("issue") or not p.get("claim"):
                 errors.append(f"line {n}: malformed premise")
+    return errors
+
+def cmd_validate(a):
+    stream = sys.stdin if a.stdin else None
+    events = load_events(stream)
+    errors = validate_events(events)
     if errors:
         print("\n".join(errors), file=sys.stderr)
         sys.exit(1)
     print(f"validate: {len(events)} record(s) OK")
+
+def cmd_doctor(a):
+    """G4: check the INSTALLATION, which the sandboxed canary cannot."""
+    root = repo_root()
+    fails, warns = [], []
+    def ok(name, detail=""):
+        print(f"OK    {name}" + (f" -- {detail}" if detail else ""))
+    def fail(name, detail):
+        fails.append(name); print(f"FAIL  {name} -- {detail}")
+    def warn(name, detail):
+        warns.append(name); print(f"WARN  {name} -- {detail}")
+
+    # 1. anchorable repo (G1)
+    if head_commit():
+        ok("repo has commits (anchors resolvable)")
+    else:
+        fail("repo has commits", "no HEAD -- VERIFIED claims cannot anchor (G1)")
+
+    # 2. ledger exists and validates
+    lp = ledger_path()
+    if os.path.exists(lp):
+        errs = validate_events(load_events())
+        if errs:
+            fail("ledger validates", f"{len(errs)} schema error(s); run truth validate")
+        else:
+            ok("ledger validates")
+    else:
+        fail("ledger exists", f"{LEDGER_REL} missing -- touch it")
+
+    # 3. union merge rule
+    ga = os.path.join(root, ".gitattributes")
+    if os.path.exists(ga) and "claims.jsonl merge=union" in open(ga, encoding="utf-8").read():
+        ok("union merge rule present")
+    else:
+        fail("union merge rule present",
+             "add '.truth/claims.jsonl merge=union' to .gitattributes (E3)")
+
+    # 4. hooks wired
+    r = subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True,
+                       text=True, cwd=root)
+    gd = r.stdout.strip()
+    if not os.path.isabs(gd):
+        gd = os.path.join(root, gd)
+    for hook, needle, purpose in (("pre-commit", "check-truth", "INV-A/INV-B"),
+                                  ("post-merge", "invalidate-scan", "INV-C")):
+        hp = os.path.join(gd, "hooks", hook)
+        if os.path.exists(hp) and os.access(hp, os.X_OK) \
+                and needle in open(hp, encoding="utf-8", errors="replace").read():
+            ok(f"{hook} hook enforces {purpose}")
+        else:
+            fail(f"{hook} hook enforces {purpose}",
+                 f"missing/not executable/does not call {needle} "
+                 "(use CI equivalents if hooks are unavailable, see README)")
+
+    # 5. discovery (G2): agents only know what they find on disk
+    found = [f for f in DISCOVERY_FILES
+             if os.path.exists(os.path.join(root, f))
+             and "scripts/truth" in open(os.path.join(root, f),
+                                         encoding="utf-8", errors="replace").read()]
+    if found:
+        ok("discovery", f"snippet found in {', '.join(found)}")
+    else:
+        fail("discovery", "no instruction file mentions scripts/truth -- the "
+             f"layer is invisible to agents (G2). Checked: {', '.join(DISCOVERY_FILES)}")
+
+    # 6. dangling premises
+    claims, premises = fold(load_events()) if os.path.exists(lp) else ({}, {})
+    dangling = [f"{i}->{c}" for i, cs in premises.items() for c in cs if c not in claims]
+    if dangling:
+        warn("premise integrity", f"dangling premise(s): {', '.join(dangling)}")
+    elif premises:
+        ok("premise integrity")
+
+    # 7. queue aging (G13)
+    old = [r_ for r_ in queue_rows(claims)
+           if r_["age_days"] is not None and r_["age_days"] > QUEUE_AGE_WARN_DAYS]
+    if old:
+        warn("queue aging", f"{len(old)} item(s) older than "
+             f"{QUEUE_AGE_WARN_DAYS}d -- attention debt accruing")
+    else:
+        ok("queue aging")
+
+    print(f"\ndoctor: {len(fails)} failure(s), {len(warns)} warning(s)")
+    sys.exit(1 if fails else 0)
 
 # ---------------------------------------------------------------- main
 
@@ -312,8 +597,14 @@ def main():
     c.add_argument("--evidence-cmd", help="re-runnable command whose output is the evidence")
     c.add_argument("--paths", help="comma-separated globs the evidence depends on")
     c.add_argument("--tier", default="P2", choices=TIERS)
-    c.add_argument("--ttl-days", type=int, default=None)
+    c.add_argument("--ttl-days", type=int, default=None,
+                   help="expiry for facts the repo cannot invalidate (G10)")
     c.add_argument("--basis", help="reasoning basis (required for INFERRED)")
+    c.add_argument("--single-run", action="store_true",
+                   help="skip the determinism double-run (expensive commands; "
+                        "accepts false-divergence risk, G6)")
+    c.add_argument("--duplicate-ok", action="store_true",
+                   help="file despite similarity to an active claim (G8)")
     c.add_argument("--json", action="store_true")
     c.set_defaults(fn=cmd_claim)
 
@@ -326,7 +617,8 @@ def main():
     v.add_argument("--json", action="store_true")
     v.set_defaults(fn=cmd_verdict)
 
-    s = sub.add_parser("invalidate-scan", help="mark claims stale whose evidence paths changed")
+    s = sub.add_parser("invalidate-scan",
+                       help="mark claims stale: paths changed, TTL expired, or anchor lost")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(fn=cmd_invalidate_scan)
 
@@ -337,18 +629,27 @@ def main():
     p.set_defaults(fn=cmd_premise)
 
     l = sub.add_parser("list", help="list claims by derived status")
-    for flag in ("unverified", "live", "stale", "diverged", "cannot_verify"):
+    for flag in STATUSES:
         l.add_argument("--" + flag.replace("_", "-"), dest=flag, action="store_true")
     l.add_argument("--json", action="store_true")
     l.set_defaults(fn=cmd_list)
 
-    q = sub.add_parser("queue", help="human review queue: divergence + stale P0/P1")
+    q = sub.add_parser("queue",
+                       help="human review queue: diverged + stale P0/P1 + unverifiable P0")
     q.add_argument("--json", action="store_true")
     q.set_defaults(fn=cmd_queue)
 
-    r = sub.add_parser("ready", help="bd ready filtered by premise validity")
+    r = sub.add_parser("ready", help="bd ready filtered by premise validity (ADR-001)")
     r.add_argument("--json", action="store_true")
     r.set_defaults(fn=cmd_ready)
+
+    d = sub.add_parser("dispatch",
+                       help="print the verifier context (prompt + claim only) for a fresh session")
+    d.add_argument("claim_id")
+    d.set_defaults(fn=cmd_dispatch)
+
+    doc = sub.add_parser("doctor", help="check the installation, not just the scripts (G4)")
+    doc.set_defaults(fn=cmd_doctor)
 
     val = sub.add_parser("validate", help="schema-check every ledger record")
     val.add_argument("--stdin", action="store_true", help="read ledger from stdin")
@@ -358,8 +659,6 @@ def main():
     try:
         args.fn(args)
     except BrokenPipeError:
-        # Downstream consumer (e.g. `| grep -q`) closed the pipe early;
-        # that is their prerogative, not our error.
         try:
             sys.stdout.close()
         except Exception:
